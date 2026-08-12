@@ -3,19 +3,92 @@
    Guestbook file-based – Bludit
    JSON ONLY • NO MySQL • NO extra folders
    Paginated front-end with next/back
+   + Anti-spam: rate limit, blacklist, no-link, captcha
    ===================================================== */
 
-$entriesFile = 'bl-themes/Perfect-Bludit-Theme-master/guestbook/entries.json';
-$maxLength  = 600;
+session_start();
+
+$entriesFile    = 'bl-themes/Perfect-Bludit-Theme-master/guestbook/entries.json';
+$rateLimitFile  = 'bl-themes/Perfect-Bludit-Theme-master/guestbook/ratelimit.json';
+$maxLength      = 600;
+$rateLimitSecs  = 60; // 1 messaggio ogni 60 secondi per IP
 
 /* --- bootstrap --- */
 if (!file_exists($entriesFile)) {
     file_put_contents($entriesFile, '[]');
 }
+if (!file_exists($rateLimitFile)) {
+    file_put_contents($rateLimitFile, '{}');
+}
 
 function esc($v) {
     return htmlspecialchars(trim($v), ENT_QUOTES, 'UTF-8');
 }
+
+function getClientIp() {
+    // Con Cloudflare (Tunnel o proxy) REMOTE_ADDR è l'IP di Cloudflare, non del visitatore.
+    // CF-Connecting-IP contiene l'IP reale del client.
+    if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
+        $ip = $_SERVER['HTTP_CF_CONNECTING_IP'];
+        if (filter_var($ip, FILTER_VALIDATE_IP)) return $ip;
+    }
+    return $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+}
+
+/* --- blacklist parole/pattern spam --- */
+$blacklist = [
+    'viagra', 'cialis', 'casino', 'скачать', 'игры', 'porn', 'xxx',
+    'bitcoin', 'crypto invest', 'loan', 'earn money', 'seo service',
+    'sex video', 'buy followers', 'click here'
+];
+
+function containsBlacklisted($text, $blacklist) {
+    $lower = mb_strtolower($text, 'UTF-8');
+    foreach ($blacklist as $word) {
+        if (mb_strpos($lower, $word) !== false) return true;
+    }
+    return false;
+}
+
+function containsLinkOrHtml($text) {
+    // blocca tag HTML e qualunque forma di link/URL
+    if (preg_match('/<[a-z\/][\s\S]*>/i', $text)) return true;
+    if (preg_match('/(https?:\/\/|www\.|\.(com|net|org|ru|xyz|info|biz)\b)/i', $text)) return true;
+    return false;
+}
+
+/* --- genera nuovo captcha matematico (immagine SVG, non testo nel DOM) --- */
+function captchaSvg($a, $b) {
+    $text = "$a + $b = ?";
+    $lines = '';
+    for ($i = 0; $i < 6; $i++) {
+        $x1 = random_int(0, 150); $y1 = random_int(0, 50);
+        $x2 = random_int(0, 150); $y2 = random_int(0, 50);
+        $color = sprintf('#%02x%02x%02x', random_int(60,120), random_int(60,120), random_int(60,120));
+        $lines .= "<line x1=\"$x1\" y1=\"$y1\" x2=\"$x2\" y2=\"$y2\" stroke=\"$color\" stroke-width=\"1\"/>";
+    }
+    $rotate = random_int(-10, 10);
+    $tx = random_int(10, 25);
+    $svg = '<svg xmlns="http://www.w3.org/2000/svg" width="150" height="50">'
+         . '<rect width="150" height="50" fill="#111"/>'
+         . $lines
+         . '<text x="' . $tx . '" y="32" font-size="21" font-family="monospace" fill="#e6e6e6" '
+         . 'transform="rotate(' . $rotate . ' 75 25)">' . htmlspecialchars($text) . '</text>'
+         . '</svg>';
+    return $svg;
+}
+
+function newCaptcha() {
+    $a = random_int(1, 9);
+    $b = random_int(1, 9);
+    $_SESSION['captcha_answer']   = $a + $b;
+    $_SESSION['captcha_svg']      = base64_encode(captchaSvg($a, $b));
+    $_SESSION['form_loaded_at']   = time();
+    $_SESSION['js_token']         = bin2hex(random_bytes(8));
+}
+
+$error = '';
+$minFillSecs = 3; // sotto questa soglia = compilazione troppo veloce per essere umana
 
 /* --- submit handler --- */
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -23,30 +96,84 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // honeypot
     if (!empty($_POST['website'])) exit;
 
-    $name = esc($_POST['name'] ?? '');
-    $msg  = esc($_POST['msg'] ?? '');
+    $name     = trim($_POST['name'] ?? '');
+    $msg      = trim($_POST['msg'] ?? '');
+    $captcha  = trim($_POST['captcha'] ?? '');
+    $jsToken  = trim($_POST['js_check'] ?? '');
 
-    if ($name === '' || $msg === '' || strlen($msg) > $maxLength) exit;
+    $ip = getClientIp();
 
-    $entry = [
-        'ts'   => date('d/m/Y H:i'),
-        'name' => $name,
-        'msg'  => $msg
-    ];
+    // 1) Captcha (contro i valori generati al caricamento del form, PRIMA di rigenerarli)
+    $captchaOk = isset($_SESSION['captcha_answer']) && (int)$captcha === (int)$_SESSION['captcha_answer'];
 
-    $data = json_decode(file_get_contents($entriesFile), true);
-    if (!is_array($data)) $data = [];
+    // 2) Token JS: se il campo non è stato popolato, il browser non ha eseguito lo script -> bot
+    $jsOk = isset($_SESSION['js_token']) && $jsToken === $_SESSION['js_token'];
 
-    $data[] = $entry;
+    // 3) Time-trap: submit troppo veloce dal caricamento pagina -> bot
+    $elapsed = isset($_SESSION['form_loaded_at']) ? (time() - $_SESSION['form_loaded_at']) : 0;
+    $tooFast = $elapsed < $minFillSecs;
 
-    file_put_contents(
-        $entriesFile,
-        json_encode($data, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT),
-        LOCK_EX
-    );
+    // 4) Validazione base
+    $validBase = ($name !== '' && $msg !== '' && strlen($msg) <= $maxLength);
 
-    header('Location: ' . $_SERVER['REQUEST_URI']);
-    exit;
+    // 5) Blacklist + link/HTML
+    $isSpam = containsBlacklisted($name . ' ' . $msg, $blacklist)
+           || containsLinkOrHtml($name)
+           || containsLinkOrHtml($msg);
+
+    // 6) Rate limit per IP
+    $rateData = json_decode(file_get_contents($rateLimitFile), true);
+    if (!is_array($rateData)) $rateData = [];
+    $lastSubmit = $rateData[$ip] ?? 0;
+    $rateLimited = (time() - $lastSubmit) < $rateLimitSecs;
+
+    if (!$captchaOk) {
+        $error = 'Captcha errato, riprova.';
+        newCaptcha();
+    } elseif (!$jsOk || $tooFast) {
+        // messaggio generico: non riveliamo ai bot quale controllo hanno fallito
+        $error = 'Invio non valido, riprova.';
+        newCaptcha();
+    } elseif (!$validBase) {
+        $error = 'Compila nome e messaggio (max ' . $maxLength . ' caratteri).';
+        newCaptcha();
+    } elseif ($isSpam) {
+        $error = 'Messaggio non consentito (link o contenuto non ammesso).';
+        newCaptcha();
+    } elseif ($rateLimited) {
+        $error = 'Aspetta qualche secondo prima di inviare un altro messaggio.';
+        newCaptcha();
+    } else {
+        // tutto ok -> salva
+        $entry = [
+            'ts'   => date('d/m/Y H:i'),
+            'name' => esc($name),
+            'msg'  => esc($msg)
+        ];
+
+        $data = json_decode(file_get_contents($entriesFile), true);
+        if (!is_array($data)) $data = [];
+        $data[] = $entry;
+
+        file_put_contents(
+            $entriesFile,
+            json_encode($data, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT),
+            LOCK_EX
+        );
+
+        // aggiorna rate limit
+        $rateData[$ip] = time();
+        file_put_contents($rateLimitFile, json_encode($rateData), LOCK_EX);
+
+        // consuma captcha e rigenera
+        newCaptcha();
+
+        header('Location: ' . $_SERVER['REQUEST_URI']);
+        exit;
+    }
+} else {
+    // GET: primo caricamento pagina -> genera captcha nuovo
+    newCaptcha();
 }
 ?>
 
@@ -58,19 +185,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <strong>Nome</strong><br>
         <textarea name="name" rows="1"
             placeholder="Inserisci il tuo nickname!"
-            style="width: 75%; font-size: 1rem; padding: 6px; border-radius: 6px; box-sizing: border-box; margin-top: 3px; background-color: #111; color: #e6e6e6;"></textarea>
+            style="width: 75%; font-size: 1rem; padding: 6px; border-radius: 6px; box-sizing: border-box; margin-top: 3px; background-color: #111; color: #e6e6e6;"><?= isset($_POST['name']) ? esc($_POST['name']) : '' ?></textarea>
     </p>
 
     <p>
         <strong>Messaggio</strong><br>
         <textarea name="msg" rows="6"
             placeholder="Scrivi qui il tuo messaggio..."
-            style="width: 75%; font-size: 1rem; padding: 6px; border-radius: 6px; box-sizing: border-box; height: 120px; margin-top: 3px; background-color: #111; color: #e6e6e6;"></textarea>
+            style="width: 75%; font-size: 1rem; padding: 6px; border-radius: 6px; box-sizing: border-box; height: 120px; margin-top: 3px; background-color: #111; color: #e6e6e6;"><?= isset($_POST['msg']) ? esc($_POST['msg']) : '' ?></textarea>
     </p>
 
-    <input type="submit" value="Invia" style="padding: 4px 8px; font-size: 0.85rem; border-radius: 6px; cursor: pointer; margin-left: 8px; background-color: #111; color: #e6e6e6;"> 
+    <p>
+        <strong>Quanto fa?</strong><br>
+        <img src="data:image/svg+xml;base64,<?= $_SESSION['captcha_svg'] ?>" alt="captcha" style="display:block; margin-top:3px; border-radius:6px;">
+        <input type="text" name="captcha" required autocomplete="off"
+            style="width: 100px; font-size: 1rem; padding: 6px; border-radius: 6px; box-sizing: border-box; margin-top: 6px; background-color: #111; color: #e6e6e6;">
+    </p>
 
-</div>
+    <?php if ($error): ?>
+        <p style="color:#ff6b6b; font-size:0.85rem;"><?= esc($error) ?></p>
+    <?php endif; ?>
+
+    <input type="submit" value="Invia" style="padding: 4px 8px; font-size: 0.85rem; border-radius: 6px; cursor: pointer; margin-left: 8px; background-color: #111; color: #e6e6e6;">
+
+    <input type="hidden" name="js_check" id="js_check" value="">
     <input type="text" name="website" style="display:none">
 </form>
 
@@ -85,7 +223,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 </div>
 <div style="font-size: 0.65rem; line-height: 1; margin-top: 4px; color: #999;">
     Powered by <a href="https://github.com/Archdart/guestbook90s" style="color:#999; text-decoration:underline;">Guestbook90s by Archdart</a>
+</div>
 <script>
+// popola il token js_check: se questo script non viene eseguito (bot senza JS),
+// il campo resta vuoto e il server scarta l'invio
+document.getElementById('js_check').value = '<?= $_SESSION['js_token'] ?>';
+
 const pageSize = 10;
 let allData = [];
 let currentPage = 0;
@@ -103,7 +246,6 @@ function renderPage() {
 
     document.getElementById('gb').textContent = out;
 
-    // Mostra/nascondi pulsanti
     document.getElementById('more').style.display = start > 0 ? 'inline-block' : 'none';
     document.getElementById('back').style.display = currentPage > 0 ? 'inline-block' : 'none';
 }
